@@ -1,7 +1,9 @@
 #!/opt/homebrew/opt/node/bin/node
 // Load inputs from a local, git-ignored .env file so they can be edited without
-// touching code. Real environment variables always take precedence over .env.
-import 'dotenv/config';
+// touching code. `override: true` makes .env values win over any stale variables
+// already exported in the shell (plain `dotenv/config` does NOT override those).
+import * as dotenv from 'dotenv';
+dotenv.config({ override: true });
 import * as cdk from 'aws-cdk-lib/core';
 import { CdkEksStack } from '../lib/cdk-eks-stack';
 
@@ -15,6 +17,14 @@ function requireEnv(name: string): string {
     );
   }
   return value;
+}
+
+/** Parse a comma/whitespace-separated environment variable into a string list. */
+function envList(name: string): string[] {
+  return (process.env[name] ?? '')
+    .split(/[\s,]+/)
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0);
 }
 
 const app = new cdk.App();
@@ -32,6 +42,15 @@ new CdkEksStack(app, 'HarnessBuildFarm', {
 
   /* VPC configuration */
   vpcId: requireEnv('VPC_ID'),
+
+  /* Optional cluster-access inputs (comma/space-separated lists). Security
+   * groups allowed to reach the private API server, and IAM role ARNs granted
+   * cluster access via EKS access entries. */
+  apiServerIngressSecurityGroupIds: envList('EKS_API_INGRESS_SECURITY_GROUP_IDS'),
+  clusterAdminRoleArns: envList('EKS_CLUSTER_ADMIN_ROLE_ARNS'),
+
+  /* Email subscribed to the SNS topic that EKS audit-log alarms notify. */
+  alarmNotificationEmail: process.env.EKS_ALARM_EMAIL,
 
   /* For more information, see https://docs.aws.amazon.com/cdk/latest/guide/environments.html */
 });
