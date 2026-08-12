@@ -15,6 +15,8 @@ export interface CdkEksStackProps extends cdk.StackProps {
    * committed; it is sourced from the environment in bin/cdk-eks.ts.
    */
   readonly harnessDelegateToken: string;
+  /** VPC ID to use for the EKS cluster. */
+  readonly vpcId: string;
 }
 
 export class CdkEksStack extends cdk.Stack {
@@ -22,7 +24,7 @@ export class CdkEksStack extends cdk.Stack {
     super(scope, id, props);
 
     const vpc = ec2.Vpc.fromLookup(this, 'Vpc', {
-      vpcId: 'vpc-02767cb7b8b634d54',
+      vpcId: props.vpcId,
     });
 
     // DP-7: customer-managed key for KMS envelope encryption of Kubernetes secrets.
@@ -33,7 +35,7 @@ export class CdkEksStack extends cdk.Stack {
 
     const cluster = new eks.Cluster(this, 'Cluster', {
       version: eks.KubernetesVersion.V1_36,
-      defaultCapacity: 5,
+      defaultCapacity: 2,
       defaultCapacityInstance: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.XLARGE),
       kubectlLayer: new KubectlV36Layer(this, 'kubectl'),
       vpc,
@@ -70,7 +72,7 @@ export class CdkEksStack extends cdk.Stack {
       // mixed-case stack name ('HarnessBuildFarm') can't be used directly.
       release: this.stackName.toLowerCase(),
       values: {
-        delegateName: 'helm-delegate',
+        delegateName: this.stackName.toLowerCase(),
         tags: `aws,eks,build-farm,${this.stackName}`,
         accountId: props.harnessAccountId,
         delegateToken: props.harnessDelegateToken,

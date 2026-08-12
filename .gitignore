@@ -3,6 +3,11 @@
 *.d.ts
 node_modules
 
+# Local secrets / inputs (never commit)
+.env
+.env.*
+!.env.example
+
 # CDK asset staging directory
 .cdk.staging
 cdk.out

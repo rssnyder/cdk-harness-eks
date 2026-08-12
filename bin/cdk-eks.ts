@@ -1,4 +1,7 @@
 #!/opt/homebrew/opt/node/bin/node
+// Load inputs from a local, git-ignored .env file so they can be edited without
+// touching code. Real environment variables always take precedence over .env.
+import 'dotenv/config';
 import * as cdk from 'aws-cdk-lib/core';
 import { CdkEksStack } from '../lib/cdk-eks-stack';
 
@@ -26,6 +29,9 @@ new CdkEksStack(app, 'HarnessBuildFarm', {
   harnessAccountId: requireEnv('HARNESS_ACCOUNT_ID'),
   harnessDelegateToken: requireEnv('HARNESS_DELEGATE_TOKEN'),
   harnessManagerEndpoint: process.env.HARNESS_MANAGER_ENDPOINT ?? 'https://app.harness.io/gratis',
+
+  /* VPC configuration */
+  vpcId: requireEnv('VPC_ID'),
 
   /* For more information, see https://docs.aws.amazon.com/cdk/latest/guide/environments.html */
 });
