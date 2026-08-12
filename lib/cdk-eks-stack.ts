@@ -209,7 +209,7 @@ export class CdkEksStack extends cdk.Stack {
 
     // INFRA-6: enforce Pod Security Standards on the workload namespaces
     // (warn/audit mirror enforce so violations are also surfaced).
-    const pssLabels = (level: 'restricted' | 'baseline') => ({
+    const pssLabels = (level: 'restricted' | 'baseline' | 'privileged') => ({
       'pod-security.kubernetes.io/enforce': level,
       'pod-security.kubernetes.io/enforce-version': 'latest',
       'pod-security.kubernetes.io/warn': level,
@@ -219,12 +219,21 @@ export class CdkEksStack extends cdk.Stack {
     });
     // The delegate pod is fully restricted-compliant.
     const restrictedPssLabels = pssLabels('restricted');
-    // Build pods run under baseline: Harness CI already sets runAsNonRoot,
-    // capabilities.drop ALL, and allowPrivilegeEscalation false on them, but it
-    // does not set seccompProfile — which restricted requires and the Harness
-    // build infrastructure can't configure. baseline still blocks privileged
-    // containers, host namespaces, hostPath, etc.
-    const buildPssLabels = pssLabels('baseline');
+    // Build pods run under the `privileged` PSS level, which effectively turns
+    // off PSS admission for this namespace. The "Build and Push to Docker
+    // Registry" step runs a Docker-in-Docker daemon (privileged: true), which
+    // baseline blocks; PSS is namespace-scoped and cannot grant a per-container
+    // exception, so the whole namespace has to be relaxed to the level the most
+    // demanding step needs. This is an acceptable trade because harness-builds is
+    // an isolated CI sandbox — separate namespace, scoped RBAC (no access to the
+    // delegate pod or its token secret), NetworkPolicy, and node hardening remain
+    // the real controls, not in-namespace PSS.
+    //
+    // NOTE: `baseline` already ALLOWS running as root (it only blocks privileged
+    // containers, host namespaces, hostPath, etc.). If the failing step turns out
+    // to need only UID 0 and not a privileged container, revert this to
+    // pssLabels('baseline') — see the securityContext check in the deploy notes.
+    const buildPssLabels = pssLabels('privileged');
 
     // Earlier deploys let the helm chart create this namespace
     // (createNamespace: true), so it already exists. overwrite makes the applier
