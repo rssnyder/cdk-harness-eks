@@ -54,6 +54,8 @@ export class CdkEksStack extends cdk.Stack {
       description: `KMS CMK for EKS Kubernetes secret envelope encryption (${id})`,
     });
 
+    const clusterSubnets = { subnetType: ec2.SubnetType.PRIVATE_ISOLATED } // this is because I host my own NAT, more than likley you want PRIVATE_WITH_EGRESS or PRIVATE_WITH_NAT
+
     const cluster = new eks.Cluster(this, 'Cluster', {
       version: eks.KubernetesVersion.V1_36,
       // No default capacity — worker nodes come from the hardened Bottlerocket
@@ -61,7 +63,7 @@ export class CdkEksStack extends cdk.Stack {
       defaultCapacity: 0,
       kubectlLayer: new KubectlV36Layer(this, 'kubectl'),
       vpc,
-      vpcSubnets: [{ subnetType: ec2.SubnetType.PRIVATE_ISOLATED }], // this is because I host my own NAT, more than likley you want PRIVATE_WITH_EGRESS or PRIVATE_WITH_NAT
+      vpcSubnets: [clusterSubnets], 
 
       // DP-7: encrypt Kubernetes secrets at rest with the customer-managed key.
       secretsEncryptionKey: secretsKey,
@@ -128,6 +130,7 @@ export class CdkEksStack extends cdk.Stack {
     // INFRA-4 + RES-1: hardened Bottlerocket managed node group spanning the
     // cluster's private subnets across multiple Availability Zones.
     cluster.addNodegroupCapacity('Hardened', {
+      subnets: clusterSubnets,
       amiType: eks.NodegroupAmiType.BOTTLEROCKET_X86_64,
       instanceTypes: [ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.XLARGE)],
       minSize: 2,
@@ -170,7 +173,7 @@ export class CdkEksStack extends cdk.Stack {
         roleArn: ebsCsiRole.roleArn,
       }],
     });
-    ebsCsiAddon.addDependency(podIdentityAgent);
+    ebsCsiAddon.addResourceDependency(podIdentityAgent);
 
     // Encrypted gp3 default StorageClass for dynamically provisioned PVs.
     const encryptedStorageClass = cluster.addManifest('EncryptedGp3StorageClass', {
@@ -269,7 +272,7 @@ export class CdkEksStack extends cdk.Stack {
       serviceAccount: delegateName,
       roleArn: delegateWorkloadRole.roleArn,
     });
-    delegatePodIdentity.addDependency(podIdentityAgent);
+    delegatePodIdentity.addResourceDependency(podIdentityAgent);
 
     const delegateChart = new eks.HelmChart(this, 'HarnessDelegate', {
       cluster: cluster,
