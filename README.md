@@ -1,14 +1,32 @@
-# Welcome to your CDK TypeScript project
+# cdk harness eks
 
-This is a blank project for CDK development with TypeScript.
+provision a secure eks cluster with a harness delegate to serve as a harness build farm.
 
-The `cdk.json` file tells the CDK Toolkit how to execute your app.
+due to the heightened security baseline of this cluster, there are certain settings that are needed on the harness stage and individual step to allow build pods to be provisioned and executed.
 
-## Useful commands
+stage infra:
+```
+              containerSecurityContext:
+                capabilities:
+                  drop:
+                    - ALL
+                privileged: false
+                allowPrivilegeEscalation: false
+                runAsNonRoot: true
+                runAsUser: "1000"
+```
 
-* `npm run build`   compile typescript to js
-* `npm run watch`   watch for changes and compile
-* `npm run test`    perform the jest unit tests
-* `npx cdk deploy`  deploy this stack to your default AWS account/region
-* `npx cdk diff`    compare deployed stack with current state
-* `npx cdk synth`   emits the synthesized CloudFormation template
+step example:
+```
+              - step:
+                  type: Run
+                  name: Run_1
+                  identifier: Run_1
+                  spec:
+                    connectorRef: account.buildfarm_container_registry_cloud
+                    image: busybox
+                    shell: Sh
+                    command: echo hello
+                    privileged: false
+
+```
