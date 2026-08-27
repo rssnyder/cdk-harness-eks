@@ -4,6 +4,7 @@ import * as eks from 'aws-cdk-lib/aws-eks';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
@@ -129,7 +130,7 @@ export class CdkEksStack extends cdk.Stack {
 
     // INFRA-4 + RES-1: hardened Bottlerocket managed node group spanning the
     // cluster's private subnets across multiple Availability Zones.
-    cluster.addNodegroupCapacity('Hardened', {
+    const hardenedNodegroup = cluster.addNodegroupCapacity('Hardened', {
       subnets: clusterSubnets,
       amiType: eks.NodegroupAmiType.BOTTLEROCKET_X86_64,
       instanceTypes: [ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.XLARGE)],
@@ -141,6 +142,21 @@ export class CdkEksStack extends cdk.Stack {
         version: nodeLaunchTemplate.latestVersionNumber,
       },
     });
+
+    // Mirrors public.ecr.aws/* into <account>.dkr.ecr.<region>.amazonaws.com/ecr-public/*
+    // on first pull. Public ECR needs no upstream credential secret.
+    new ecr.CfnPullThroughCacheRule(this, 'EcrPublicPullThroughCache', {
+      ecrRepositoryPrefix: 'ecr-public',
+      upstreamRegistryUrl: 'public.ecr.aws',
+    });
+
+    // Lets the node role satisfy ECR pull-through cache requests (creating the
+    // local mirror repo + importing the image) against a public upstream registry.
+    hardenedNodegroup.role.addToPrincipalPolicy(new iam.PolicyStatement({
+      sid: 'EcrPullThroughCache',
+      actions: ['ecr:BatchImportUpstreamImage', 'ecr:CreateRepository'],
+      resources: ['*'],
+    }));
 
     // DP-8 (persistent volumes): EBS CSI driver via EKS Pod Identity plus an
     // encrypted gp3 default StorageClass. Pod Identity keeps the driver's AWS
@@ -193,6 +209,83 @@ export class CdkEksStack extends cdk.Stack {
       allowVolumeExpansion: true,
     });
     encryptedStorageClass.node.addDependency(ebsCsiAddon);
+
+    // Cluster Autoscaler for the hardened node group: scales the managed
+    // node group's ASG (auto-discovered via the k8s.io/cluster-autoscaler/*
+    // tags EKS applies to every managed node group's ASG automatically) in
+    // response to unschedulable/underutilized pods. Auth via EKS Pod Identity
+    // (IAM-4), matching the ebs-csi-driver pattern above.
+    const clusterAutoscalerRole = new iam.Role(this, 'ClusterAutoscalerRole', {
+      assumedBy: new iam.ServicePrincipal('pods.eks.amazonaws.com'),
+      description: 'EKS Pod Identity role for the Kubernetes Cluster Autoscaler',
+    });
+    clusterAutoscalerRole.assumeRolePolicy?.addStatements(new iam.PolicyStatement({
+      actions: ['sts:TagSession'],
+      principals: [new iam.ServicePrincipal('pods.eks.amazonaws.com')],
+    }));
+    clusterAutoscalerRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      sid: 'ClusterAutoscalerScaling',
+      actions: ['autoscaling:SetDesiredCapacity', 'autoscaling:TerminateInstanceInAutoScalingGroup'],
+      resources: ['*'],
+      conditions: {
+        StringEquals: {
+          'aws:ResourceTag/k8s.io/cluster-autoscaler/enabled': 'true',
+          [`aws:ResourceTag/k8s.io/cluster-autoscaler/${cluster.clusterName}`]: 'owned',
+        },
+      },
+    }));
+    clusterAutoscalerRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      sid: 'ClusterAutoscalerDescribe',
+      actions: [
+        'autoscaling:DescribeAutoScalingGroups',
+        'autoscaling:DescribeAutoScalingInstances',
+        'autoscaling:DescribeLaunchConfigurations',
+        'autoscaling:DescribeScalingActivities',
+        'autoscaling:DescribeTags',
+        'ec2:DescribeImages',
+        'ec2:DescribeInstanceTypes',
+        'ec2:DescribeLaunchTemplateVersions',
+        'ec2:GetInstanceTypesFromInstanceRequirements',
+        'eks:DescribeNodegroup',
+      ],
+      resources: ['*'],
+    }));
+
+    const clusterAutoscalerPodIdentity = new eks.CfnPodIdentityAssociation(this, 'ClusterAutoscalerPodIdentity', {
+      clusterName: cluster.clusterName,
+      namespace: 'kube-system',
+      serviceAccount: 'cluster-autoscaler',
+      roleArn: clusterAutoscalerRole.roleArn,
+    });
+    clusterAutoscalerPodIdentity.addResourceDependency(podIdentityAgent);
+
+    const clusterAutoscalerChart = new eks.HelmChart(this, 'ClusterAutoscaler', {
+      cluster,
+      chart: 'cluster-autoscaler',
+      repository: 'https://kubernetes.github.io/autoscaler',
+      namespace: 'kube-system',
+      release: 'cluster-autoscaler',
+      values: {
+        autoDiscovery: { clusterName: cluster.clusterName },
+        awsRegion: this.region,
+        cloudProvider: 'aws',
+        rbac: {
+          serviceAccount: {
+            create: true,
+            name: 'cluster-autoscaler',
+            // Pod Identity matches on namespace + service account name; no IRSA
+            // OIDC annotation needed.
+            annotations: {},
+          },
+        },
+        extraArgs: {
+          // Only touch this cluster's own node group; the ASG tag condition
+          // above is a second, IAM-enforced guardrail against cross-cluster writes.
+          'balance-similar-node-groups': true,
+        },
+      },
+    });
+    clusterAutoscalerChart.node.addDependency(clusterAutoscalerPodIdentity);
 
     // Helm release names must be lowercase RFC 1123 DNS-1123 labels, so the
     // mixed-case stack name ('HarnessBuildFarm') can't be used directly. The
