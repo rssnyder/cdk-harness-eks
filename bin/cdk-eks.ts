@@ -39,6 +39,9 @@ new CdkEksStack(app, 'HarnessBuildFarm', {
   harnessAccountId: requireEnv('HARNESS_ACCOUNT_ID'),
   harnessDelegateToken: requireEnv('HARNESS_DELEGATE_TOKEN'),
   harnessManagerEndpoint: process.env.HARNESS_MANAGER_ENDPOINT ?? 'https://app.harness.io/gratis',
+  harnessDelegateImage:
+    process.env.HARNESS_DELEGATE_IMAGE ??
+    'us-docker.pkg.dev/gar-prod-setup/harness-public/harness/delegate:26.07.89706',
 
   /* VPC configuration */
   vpcId: requireEnv('VPC_ID'),

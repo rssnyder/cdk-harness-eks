@@ -21,6 +21,12 @@ export interface CdkEksStackProps extends cdk.StackProps {
    * committed; it is sourced from the environment in bin/cdk-eks.ts.
    */
   readonly harnessDelegateToken: string;
+  /**
+   * Container image for the Harness delegate (repository:tag). Pinned rather
+   * than left to the chart default/upgrader so `helm upgrade` runs stay
+   * idempotent (see the `upgrader.enabled: false` note below).
+   */
+  readonly harnessDelegateImage: string;
   /** VPC ID to use for the EKS cluster. */
   readonly vpcId: string;
   /**
@@ -291,7 +297,7 @@ export class CdkEksStack extends cdk.Stack {
         accountId: props.harnessAccountId,
         delegateToken: props.harnessDelegateToken,
         managerEndpoint: props.harnessManagerEndpoint,
-        delegateDockerImage: 'us-docker.pkg.dev/gar-prod-setup/harness-public/harness/delegate:26.07.89706',
+        delegateDockerImage: props.harnessDelegateImage,
         replicas: 1,
         // Upgrader disabled: the delegate image is managed declaratively via the
         // pinned delegateDockerImage above. Leaving the in-cluster upgrader on
