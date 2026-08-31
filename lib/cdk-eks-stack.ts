@@ -223,15 +223,21 @@ export class CdkEksStack extends cdk.Stack {
       actions: ['sts:TagSession'],
       principals: [new iam.ServicePrincipal('pods.eks.amazonaws.com')],
     }));
+    // The condition key itself embeds the (deploy-time-resolved) cluster name,
+    // so it can't be a plain object key (CDK needs a string, not a token, for
+    // map keys) — CfnJson defers that resolution to deployment time.
+    const clusterAutoscalerTagCondition = new cdk.CfnJson(this, 'ClusterAutoscalerTagCondition', {
+      value: {
+        'aws:ResourceTag/k8s.io/cluster-autoscaler/enabled': 'true',
+        [`aws:ResourceTag/k8s.io/cluster-autoscaler/${cluster.clusterName}`]: 'owned',
+      },
+    });
     clusterAutoscalerRole.addToPrincipalPolicy(new iam.PolicyStatement({
       sid: 'ClusterAutoscalerScaling',
       actions: ['autoscaling:SetDesiredCapacity', 'autoscaling:TerminateInstanceInAutoScalingGroup'],
       resources: ['*'],
       conditions: {
-        StringEquals: {
-          'aws:ResourceTag/k8s.io/cluster-autoscaler/enabled': 'true',
-          [`aws:ResourceTag/k8s.io/cluster-autoscaler/${cluster.clusterName}`]: 'owned',
-        },
+        StringEquals: clusterAutoscalerTagCondition,
       },
     }));
     clusterAutoscalerRole.addToPrincipalPolicy(new iam.PolicyStatement({
@@ -385,7 +391,7 @@ export class CdkEksStack extends cdk.Stack {
         delegateToken: props.harnessDelegateToken,
         managerEndpoint: props.harnessManagerEndpoint,
         delegateDockerImage: 'us-docker.pkg.dev/gar-prod-setup/harness-public/harness/delegate:26.07.89706',
-        replicas: 1,
+        replicas: 2,
         // Upgrader disabled: the delegate image is managed declaratively via the
         // pinned delegateDockerImage above. Leaving the in-cluster upgrader on
         // makes it take server-side-apply ownership of the Deployment's image
