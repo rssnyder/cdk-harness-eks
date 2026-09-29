@@ -45,6 +45,12 @@ export interface CdkEksStackProps extends cdk.StackProps {
    * Optional; empty means the topic is created but no email subscription added.
    */
   readonly alarmNotificationEmail?: string;
+  /**
+   * Host of the Harness OIDC issuer, used to build
+   * https://<host>/ng/api/oidc/account/<harnessAccountId> for the IAM OIDC
+   * provider. Defaults to 'accounts.harness.io' in bin/cdk-eks.ts.
+   */
+  readonly harnessOidcProviderHost: string;
 }
 
 export class CdkEksStack extends cdk.Stack {
@@ -92,6 +98,79 @@ export class CdkEksStack extends cdk.Stack {
       // IAM-1: authenticate via AWS IAM principals through EKS access entries.
       authenticationMode: eks.AuthenticationMode.API,
     });
+
+    // Federates the per-account Harness OIDC issuer into IAM so Harness
+    // pipelines can AssumeRoleWithWebIdentity into AWS without static
+    // credentials.
+    const harnessOidcProvider = new iam.OpenIdConnectProvider(this, 'HarnessOidcProvider', {
+      url: `https://${props.harnessOidcProviderHost}/ng/api/oidc/account/${props.harnessAccountId}`,
+      clientIds: ['sts.amazonaws.com'],
+    });
+
+    // Role Harness pipelines assume via the OIDC provider above (no static
+    // credentials). Trust is scoped to the aud claim only, for now — anyone
+    // holding a valid token from this Harness account's issuer can assume it.
+    // Permissions below are intentionally broad (Resource: '*') as a starting
+    // point; tighten to specific secret/repo/bucket ARNs once those are known.
+    // openIdConnectProviderIssuer is a deploy-time token (derived from the
+    // provider's ARN), so it can't be used directly as a JS object key —
+    // CfnJson defers building this map until deploy time instead.
+    const harnessOidcAudCondition = new cdk.CfnJson(this, 'HarnessOidcAudCondition', {
+      value: {
+        [`${harnessOidcProvider.openIdConnectProviderIssuer}:aud`]: 'sts.amazonaws.com',
+      },
+    });
+
+    const harnessOidcWorkloadRole = new iam.Role(this, 'HarnessOidcWorkloadRole', {
+      assumedBy: new iam.OpenIdConnectPrincipal(harnessOidcProvider, {
+        StringEquals: harnessOidcAudCondition,
+      }),
+      description: 'Federated (Harness OIDC) role: Secrets Manager read, ECR build/push, S3 object write.',
+    });
+
+    harnessOidcWorkloadRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'SecretsManagerReadAny',
+      actions: ['secretsmanager:GetSecretValue', 'secretsmanager:DescribeSecret', 'secretsmanager:ListSecrets'],
+      resources: ['*'],
+    }));
+
+    harnessOidcWorkloadRole.addToPolicy(new iam.PolicyStatement({
+      // GetAuthorizationToken (needed by `docker login`) only supports
+      // Resource: '*' — AWS rejects any other resource ARN on this action.
+      sid: 'EcrAuth',
+      actions: ['ecr:GetAuthorizationToken'],
+      resources: ['*'],
+    }));
+
+    harnessOidcWorkloadRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'EcrBuildAndPush',
+      actions: [
+        'ecr:BatchCheckLayerAvailability',
+        'ecr:GetDownloadUrlForLayer',
+        'ecr:BatchGetImage',
+        'ecr:PutImage',
+        'ecr:InitiateLayerUpload',
+        'ecr:UploadLayerPart',
+        'ecr:CompleteLayerUpload',
+        'ecr:CreateRepository',
+        'ecr:DescribeRepositories',
+        'ecr:ListImages',
+        'ecr:DescribeImages',
+      ],
+      resources: ['*'],
+    }));
+
+    harnessOidcWorkloadRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'AllowS3BucketAccess',
+      actions: ['s3:PutObject', 's3:GetObject', 's3:ListBucket', 's3:DeleteObject'],
+      resources: ['*'],
+    }));
+
+    harnessOidcWorkloadRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'AllowDescribeRegions',
+      actions: ['ec2:DescribeRegions'],
+      resources: ['*'],
+    }));
 
     // DP-8: dedicated customer-managed key for worker node and persistent
     // volume encryption (kept separate from the secrets CMK for blast-radius).

@@ -42,6 +42,7 @@ new CdkEksStack(app, 'HarnessBuildFarm', {
   harnessDelegateImage:
     process.env.HARNESS_DELEGATE_IMAGE ??
     'us-docker.pkg.dev/gar-prod-setup/harness-public/harness/delegate:26.07.89706',
+  harnessOidcProviderHost: process.env.HARNESS_OIDC_PROVIDER_HOST ?? 'accounts.harness.io',
 
   /* VPC configuration */
   vpcId: requireEnv('VPC_ID'),
