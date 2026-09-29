@@ -51,6 +51,12 @@ export interface CdkEksStackProps extends cdk.StackProps {
    * provider. Defaults to 'accounts.harness.io' in bin/cdk-eks.ts.
    */
   readonly harnessOidcProviderHost: string;
+  /**
+   * Cluster autoscaler image repository. Defaults to the Docker Hub mirror;
+   * swap to a public ECR repo (e.g. public.ecr.aws/autoscaling/cluster-autoscaler)
+   * if Docker Hub's anonymous pull rate limit becomes an issue.
+   */
+  readonly clusterAutoscalerImageRepository?: string;
 }
 
 export class CdkEksStack extends cdk.Stack {
@@ -360,6 +366,7 @@ export class CdkEksStack extends cdk.Stack {
         autoDiscovery: { clusterName: cluster.clusterName },
         awsRegion: this.region,
         cloudProvider: 'aws',
+        image: { repository: props.clusterAutoscalerImageRepository ?? 'docker.io/autoscaling/cluster-autoscaler' },
         rbac: {
           serviceAccount: {
             create: true,
