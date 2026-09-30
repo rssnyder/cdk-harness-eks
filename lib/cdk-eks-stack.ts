@@ -366,7 +366,7 @@ export class CdkEksStack extends cdk.Stack {
         autoDiscovery: { clusterName: cluster.clusterName },
         awsRegion: this.region,
         cloudProvider: 'aws',
-        image: { repository: props.clusterAutoscalerImageRepository ?? 'docker.io/autoscaling/cluster-autoscaler' },
+        image: { repository: props.clusterAutoscalerImageRepository ?? 'registry.k8s.io/autoscaling/cluster-autoscaler' },
         rbac: {
           serviceAccount: {
             create: true,
