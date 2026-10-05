@@ -58,11 +58,30 @@ export interface CdkEksStackProps extends cdk.StackProps {
    */
   readonly clusterAutoscalerImageRepository?: string;
   readonly clusterAutoscalerImageTag?: string;
+  /**
+   * Arbitrary tag key/values applied to every taggable AWS resource in the
+   * stack and, as labels, to the Kubernetes namespaces. Values used as labels
+   * must be valid k8s label values (<=63 chars, alphanumeric, '-', '_', '.').
+   */
+  readonly tags?: Record<string, string>;
+  /**
+   * Image registry prefixes (with trailing '/') pods may pull from in
+   * application namespaces, e.g. `<acct>.dkr.ecr.<region>.amazonaws.com/`.
+   * Empty/unset means no registry policy is created.
+   */
+  readonly allowedImageRegistries?: string[];
+  /** Deny (true) vs. only warn/audit (false, default) on disallowed registries. */
+  readonly enforceAllowedImageRegistries?: boolean;
 }
 
 export class CdkEksStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: CdkEksStackProps) {
     super(scope, id, props);
+
+    const tags = props.tags ?? {};
+    for (const [k, v] of Object.entries(tags)) {
+      cdk.Tags.of(this).add(k, v);
+    }
 
     const vpc = ec2.Vpc.fromLookup(this, 'Vpc', {
       vpcId: props.vpcId,
@@ -81,6 +100,8 @@ export class CdkEksStack extends cdk.Stack {
       // No default capacity — worker nodes come from the hardened Bottlerocket
       // managed node group defined below.
       defaultCapacity: 0,
+      // The cluster is a custom resource, so stack-level Tags do not reach it.
+      tags: props.tags,
       kubectlLayer: new KubectlV36Layer(this, 'kubectl'),
       vpc,
       vpcSubnets: [clusterSubnets], 
@@ -440,7 +461,7 @@ export class CdkEksStack extends cdk.Stack {
       manifest: [{
         apiVersion: 'v1',
         kind: 'Namespace',
-        metadata: { name: delegateNamespace, labels: restrictedPssLabels },
+        metadata: { name: delegateNamespace, labels: { ...tags, ...restrictedPssLabels } },
       }],
     });
 
@@ -547,8 +568,136 @@ export class CdkEksStack extends cdk.Stack {
     const buildNs = cluster.addManifest('HarnessBuildNamespace', {
       apiVersion: 'v1',
       kind: 'Namespace',
-      metadata: { name: buildNamespace, labels: buildPssLabels },
+      metadata: { name: buildNamespace, labels: { ...tags, ...buildPssLabels } },
     });
+
+    // INFRA-5: the VPC CNI only enforces NetworkPolicy when its network policy
+    // agent is enabled; adopt the default add-on to turn it on.
+    new eks.CfnAddon(this, 'VpcCniAddon', {
+      clusterName: cluster.clusterName,
+      addonName: 'vpc-cni',
+      resolveConflicts: 'OVERWRITE',
+      configurationValues: JSON.stringify({ enableNetworkPolicy: 'true' }),
+    });
+
+    // Namespace guardrails applied at creation: ResourceQuota, LimitRange
+    // defaults, default-deny NetworkPolicy (ingress + egress), DNS egress, plus
+    // any namespace-specific allow policies.
+    type NetpolRule = Record<string, unknown>;
+    const nsName = (name: string) => ({ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': name } } });
+    const guardNamespace = (
+      id: string,
+      ns: Construct,
+      namespace: string,
+      quota: Record<string, string>,
+      allow: { ingress?: NetpolRule[]; egress?: NetpolRule[] },
+    ) => {
+      const policy = (name: string, spec: Record<string, unknown>) => ({
+        apiVersion: 'networking.k8s.io/v1',
+        kind: 'NetworkPolicy',
+        metadata: { name, namespace },
+        spec: { podSelector: {}, ...spec },
+      });
+      const m = cluster.addManifest(id,
+        {
+          apiVersion: 'v1',
+          kind: 'ResourceQuota',
+          metadata: { name: 'default-quota', namespace },
+          spec: { hard: quota },
+        },
+        {
+          // Defaults requests only: a default limit could OOM-kill DinD builds.
+          apiVersion: 'v1',
+          kind: 'LimitRange',
+          metadata: { name: 'default-requests', namespace },
+          spec: { limits: [{ type: 'Container', defaultRequest: { cpu: '100m', memory: '128Mi' } }] },
+        },
+        policy('default-deny', { policyTypes: ['Ingress', 'Egress'] }),
+        policy('allow-dns', {
+          policyTypes: ['Egress'],
+          egress: [{
+            to: [{ ...nsName('kube-system'), podSelector: { matchLabels: { 'k8s-app': 'kube-dns' } } }],
+            ports: [{ protocol: 'UDP', port: 53 }, { protocol: 'TCP', port: 53 }],
+          }],
+        }),
+        ...(allow.ingress ? [policy('allow-ingress', { policyTypes: ['Ingress'], ingress: allow.ingress })] : []),
+        ...(allow.egress ? [policy('allow-egress', { policyTypes: ['Egress'], egress: allow.egress })] : []),
+      );
+      m.node.addDependency(ns);
+    };
+
+    // ponytail: egress to 0.0.0.0/0 on fixed ports; narrow to Harness/registry CIDRs or an egress proxy if required.
+    const anyIp = { ipBlock: { cidr: '0.0.0.0/0' } };
+    guardNamespace('HarnessDelegateGuardrails', delegateNs, delegateNamespace,
+      { pods: '10', 'requests.cpu': '4', 'requests.memory': '8Gi' },
+      {
+        egress: [
+          // Harness manager, AWS APIs, and the private EKS API endpoint.
+          { to: [anyIp], ports: [{ protocol: 'TCP', port: 443 }] },
+          // Delegate -> build pod lite-engine.
+          { to: [nsName(buildNamespace)], ports: [{ protocol: 'TCP', port: 2001 }] },
+          // EKS Pod Identity agent (node-local link-local address).
+          { to: [{ ipBlock: { cidr: '169.254.170.23/32' } }], ports: [{ protocol: 'TCP', port: 80 }] },
+        ],
+      });
+    guardNamespace('HarnessBuildGuardrails', buildNs, buildNamespace,
+      { pods: '50', 'requests.cpu': '16', 'requests.memory': '48Gi' },
+      {
+        ingress: [{ from: [nsName(delegateNamespace)], ports: [{ protocol: 'TCP', port: 2001 }] }],
+        egress: [{ to: [anyIp], ports: [80, 443, 22].map((port) => ({ protocol: 'TCP', port })) }],
+      });
+
+    // DP: images may only come from approved registries. Applies to every
+    // namespace except system ones. Defaults to warn+audit so it can be rolled
+    // out before enforcing. ponytail: CREATE only (UPDATE would block metadata
+    // writes on pods already running a disallowed image).
+    if (props.allowedImageRegistries?.length) {
+      const policyName = 'allowed-image-registries';
+      const policyManifest = cluster.addManifest('AllowedImageRegistriesPolicy',
+        {
+          apiVersion: 'admissionregistration.k8s.io/v1',
+          kind: 'ValidatingAdmissionPolicy',
+          metadata: { name: policyName },
+          spec: {
+            failurePolicy: 'Fail',
+            matchConstraints: {
+              resourceRules: [{ apiGroups: [''], apiVersions: ['v1'], operations: ['CREATE'], resources: ['pods'] }],
+            },
+            variables: [
+              { name: 'registries', expression: JSON.stringify(props.allowedImageRegistries) },
+              {
+                name: 'images',
+                expression:
+                  '(object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : [])).map(c, c.image)',
+              },
+            ],
+            validations: [{
+              expression: 'variables.images.all(i, variables.registries.exists(r, i.startsWith(r)))',
+              messageExpression: '"images must come from approved registries: " + variables.registries.join(", ")',
+            }],
+          },
+        },
+        {
+          apiVersion: 'admissionregistration.k8s.io/v1',
+          kind: 'ValidatingAdmissionPolicyBinding',
+          metadata: { name: policyName },
+          spec: {
+            policyName,
+            validationActions: props.enforceAllowedImageRegistries ? ['Deny', 'Audit'] : ['Warn', 'Audit'],
+            matchResources: {
+              namespaceSelector: {
+                matchExpressions: [{
+                  key: 'kubernetes.io/metadata.name',
+                  operator: 'NotIn',
+                  values: ['kube-system', 'kube-public', 'kube-node-lease', 'default'],
+                }],
+              },
+            },
+          },
+        },
+      );
+      policyManifest.node.addDependency(cluster);
+    }
 
     // IAM-3: least-privilege Role for running build pods, plus a RoleBinding for
     // the delegate SA (which lives in the delegate namespace). The delegate

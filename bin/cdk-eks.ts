@@ -27,6 +27,17 @@ function envList(name: string): string[] {
     .filter((v) => v.length > 0);
 }
 
+/** Parse EKS_TAGS="key=value,key2=value2" into a record. */
+function envTags(name: string): Record<string, string> {
+  return Object.fromEntries(
+    envList(name).map((kv) => {
+      const i = kv.indexOf('=');
+      if (i < 1) throw new Error(`${name}: expected key=value, got "${kv}"`);
+      return [kv.slice(0, i), kv.slice(i + 1)];
+    }),
+  );
+}
+
 const app = new cdk.App();
 new CdkEksStack(app, 'HarnessBuildFarm', {
   /* Vpc.fromLookup requires an explicit account/region, taken here from the
@@ -41,7 +52,7 @@ new CdkEksStack(app, 'HarnessBuildFarm', {
   harnessManagerEndpoint: process.env.HARNESS_MANAGER_ENDPOINT ?? 'https://app.harness.io/gratis',
   harnessDelegateImage:
     process.env.HARNESS_DELEGATE_IMAGE ??
-    'us-docker.pkg.dev/gar-prod-setup/harness-public/harness/delegate:26.07.89706',
+    'public.ecr.aws/harness/harness/delegate:26.09.90106',
   harnessOidcProviderHost: process.env.HARNESS_OIDC_PROVIDER_HOST ?? 'accounts.harness.io',
 
   /* VPC configuration */
@@ -55,6 +66,13 @@ new CdkEksStack(app, 'HarnessBuildFarm', {
 
   /* Email subscribed to the SNS topic that EKS audit-log alarms notify. */
   alarmNotificationEmail: process.env.EKS_ALARM_EMAIL,
+
+  /* Approved image registry prefixes (trailing '/'); unset disables the policy. */
+  allowedImageRegistries: envList('EKS_ALLOWED_IMAGE_REGISTRIES'),
+  enforceAllowedImageRegistries: process.env.EKS_ENFORCE_IMAGE_REGISTRIES === 'true',
+
+  /* Generic tags applied to all AWS resources and namespace labels. */
+  tags: envTags('EKS_TAGS'),
 
   /* For more information, see https://docs.aws.amazon.com/cdk/latest/guide/environments.html */
 });
