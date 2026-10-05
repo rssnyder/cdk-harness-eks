@@ -58,11 +58,22 @@ export interface CdkEksStackProps extends cdk.StackProps {
    */
   readonly clusterAutoscalerImageRepository?: string;
   readonly clusterAutoscalerImageTag?: string;
+  /**
+   * Arbitrary tag key/values applied to every taggable AWS resource in the
+   * stack and, as labels, to the Kubernetes namespaces. Values used as labels
+   * must be valid k8s label values (<=63 chars, alphanumeric, '-', '_', '.').
+   */
+  readonly tags?: Record<string, string>;
 }
 
 export class CdkEksStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: CdkEksStackProps) {
     super(scope, id, props);
+
+    const tags = props.tags ?? {};
+    for (const [k, v] of Object.entries(tags)) {
+      cdk.Tags.of(this).add(k, v);
+    }
 
     const vpc = ec2.Vpc.fromLookup(this, 'Vpc', {
       vpcId: props.vpcId,
@@ -440,7 +451,7 @@ export class CdkEksStack extends cdk.Stack {
       manifest: [{
         apiVersion: 'v1',
         kind: 'Namespace',
-        metadata: { name: delegateNamespace, labels: restrictedPssLabels },
+        metadata: { name: delegateNamespace, labels: { ...tags, ...restrictedPssLabels } },
       }],
     });
 
@@ -547,7 +558,7 @@ export class CdkEksStack extends cdk.Stack {
     const buildNs = cluster.addManifest('HarnessBuildNamespace', {
       apiVersion: 'v1',
       kind: 'Namespace',
-      metadata: { name: buildNamespace, labels: buildPssLabels },
+      metadata: { name: buildNamespace, labels: { ...tags, ...buildPssLabels } },
     });
 
     // IAM-3: least-privilege Role for running build pods, plus a RoleBinding for
