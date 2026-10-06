@@ -8,6 +8,9 @@ import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as dlm from 'aws-cdk-lib/aws-dlm';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as snsSubscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
 import { KubectlV36Layer } from '@aws-cdk/lambda-layer-kubectl-v36';
@@ -21,7 +24,13 @@ export interface CdkEksStackProps extends cdk.StackProps {
    * Harness delegate token. This is a secret and must never be hard-coded or
    * committed; it is sourced from the environment in bin/cdk-eks.ts.
    */
-  readonly harnessDelegateToken: string;
+  readonly harnessDelegateToken?: string;
+  /**
+   * Name of an existing Secrets Manager secret (plain-string token, created out
+   * of band) synced into the delegate namespace by External Secrets Operator.
+   * Preferred over harnessDelegateToken, which lands in the synthesized template.
+   */
+  readonly harnessDelegateTokenSecretName?: string;
   /**
    * Container image for the Harness delegate (repository:tag). Pinned rather
    * than left to the chart default/upgrader so `helm upgrade` runs stay
@@ -70,6 +79,24 @@ export interface CdkEksStackProps extends cdk.StackProps {
    * Empty/unset means no registry policy is created.
    */
   readonly allowedImageRegistries?: string[];
+  /** CIDRs allowed to reach the API server over the public endpoint. Unset keeps it private-only. */
+  readonly publicEndpointCidrs?: string[];
+  /** Short cluster name; resources are named `{environment}-{clusterName}-...`. */
+  readonly clusterName: string;
+  /** Deployment environment; drives naming and persona access (engineer: dev=admin, test=view, prod=none). */
+  readonly environment: 'dev' | 'test' | 'prod';
+  /** Persona -> IAM role (e.g. Okta-federated) granted EKS access entries scoped to the app namespaces. */
+  readonly accessEntries?: Array<{ persona: 'engineer' | 'devops' | 'support' | 'breakglass'; roleArn: string }>;
+  /** Install the GuardDuty runtime agent add-on. Leave off if org-level GuardDuty auto-manages it. */
+  readonly enableGuardDutyAgent?: boolean;
+  /** ECR repositories to create (KMS-encrypted, scan-on-push, immutable tags). */
+  readonly ecrRepositoryNames?: string[];
+  /** Deploy Velero (cluster-state backups to an encrypted, versioned S3 bucket). */
+  readonly enableVelero?: boolean;
+  /** Velero AWS plugin image. */
+  readonly veleroPluginImage?: string;
+  /** Snapshots retained by the daily EBS DLM policy (default 7). */
+  readonly ebsSnapshotRetentionCount?: number;
   /** Deny (true) vs. only warn/audit (false, default) on disallowed registries. */
   readonly enforceAllowedImageRegistries?: boolean;
 }
@@ -78,6 +105,12 @@ export class CdkEksStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: CdkEksStackProps) {
     super(scope, id, props);
 
+    if (!props.harnessDelegateToken && !props.harnessDelegateTokenSecretName) {
+      throw new Error('Set harnessDelegateTokenSecretName (preferred) or harnessDelegateToken.');
+    }
+
+    // Naming standard: {environment}-{clustername}[-suffix].
+    const prefix = `${props.environment}-${props.clusterName}`;
     const tags = props.tags ?? {};
     for (const [k, v] of Object.entries(tags)) {
       cdk.Tags.of(this).add(k, v);
@@ -95,7 +128,24 @@ export class CdkEksStack extends cdk.Stack {
 
     const clusterSubnets = { subnetType: ec2.SubnetType.PRIVATE_ISOLATED } // this is because I host my own NAT, more than likley you want PRIVATE_WITH_EGRESS or PRIVATE_WITH_NAT
 
+    const clusterRole = new iam.Role(this, 'ClusterRole', {
+      roleName: `${prefix}-cluster-role`,
+      assumedBy: new iam.ServicePrincipal('eks.amazonaws.com'),
+      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonEKSClusterPolicy')],
+    });
+    const nodeRole = new iam.Role(this, 'NodeRole', {
+      roleName: `${prefix}-node-role`,
+      assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonEKSWorkerNodePolicy'),
+        iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonEKS_CNI_Policy'),
+        iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonEC2ContainerRegistryReadOnly'),
+      ],
+    });
+
     const cluster = new eks.Cluster(this, 'Cluster', {
+      clusterName: prefix,
+      role: clusterRole,
       version: eks.KubernetesVersion.V1_36,
       // No default capacity — worker nodes come from the hardened Bottlerocket
       // managed node group defined below.
@@ -111,7 +161,10 @@ export class CdkEksStack extends cdk.Stack {
 
       // INFRA-1: private-only API server endpoint. kubectl/CDK must reach it from
       // within the VPC; CDK runs its kubectl provider inside the cluster VPC.
-      endpointAccess: eks.EndpointAccess.PRIVATE,
+      // Optionally also expose the endpoint to approved CIDRs (e.g. a test workstation).
+      endpointAccess: props.publicEndpointCidrs?.length
+        ? eks.EndpointAccess.PUBLIC_AND_PRIVATE.onlyFrom(...props.publicEndpointCidrs)
+        : eks.EndpointAccess.PRIVATE,
 
       // LOG-1: enable all five control plane log types (audit + authenticator are
       // the minimum required; all five are recommended).
@@ -231,6 +284,7 @@ export class CdkEksStack extends cdk.Stack {
     // non host-network pods cannot reach IMDS and assume the node role) and
     // encrypting both Bottlerocket volumes with the CMK.
     const nodeLaunchTemplate = new ec2.LaunchTemplate(this, 'NodeLaunchTemplate', {
+      launchTemplateName: `${prefix}-lt-build`,
       requireImdsv2: true,
       httpPutResponseHopLimit: 1,
       blockDevices: [
@@ -244,6 +298,8 @@ export class CdkEksStack extends cdk.Stack {
     // INFRA-4 + RES-1: hardened Bottlerocket managed node group spanning the
     // cluster's private subnets across multiple Availability Zones.
     const hardenedNodegroup = cluster.addNodegroupCapacity('Hardened', {
+      nodegroupName: `${prefix}-ng-build`,
+      nodeRole,
       subnets: clusterSubnets,
       amiType: eks.NodegroupAmiType.BOTTLEROCKET_X86_64,
       instanceTypes: [ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.XLARGE)],
@@ -411,7 +467,8 @@ export class CdkEksStack extends cdk.Stack {
     // mixed-case stack name ('HarnessBuildFarm') can't be used directly. The
     // chart names the delegate's ServiceAccount after the release.
     const delegateName = this.stackName.toLowerCase();
-    const delegateNamespace = 'harness-delegate-ng';
+    const delegateNamespace = 'harness-delegate';
+    const delegateTokenK8sSecret = 'harness-delegate-token';
     // Builds run in a separate namespace so the delegate's pod/secret permissions
     // never apply in the namespace that holds the delegate pod and its token
     // secret. Point the Harness CI Kubernetes build infrastructure at this namespace.
@@ -502,7 +559,10 @@ export class CdkEksStack extends cdk.Stack {
         k8sPermissionsType: delegateSelfRoleName,
         tags: `aws,eks,build-farm,${this.stackName}`,
         accountId: props.harnessAccountId,
-        delegateToken: props.harnessDelegateToken,
+        // With a secret name, the token comes from the ESO-synced Kubernetes secret.
+        ...(props.harnessDelegateTokenSecretName
+          ? { existingDelegateToken: delegateTokenK8sSecret }
+          : { delegateToken: props.harnessDelegateToken }),
         managerEndpoint: props.harnessManagerEndpoint,
         delegateDockerImage: props.harnessDelegateImage,
         replicas: 1,
@@ -627,25 +687,96 @@ export class CdkEksStack extends cdk.Stack {
     };
 
     // ponytail: egress to 0.0.0.0/0 on fixed ports; narrow to Harness/registry CIDRs or an egress proxy if required.
-    const anyIp = { ipBlock: { cidr: '0.0.0.0/0' } };
+    // Link-local excluded so pods cannot reach IMDS even if the hop limit is misconfigured.
+    const anyIp = { ipBlock: { cidr: '0.0.0.0/0', except: ['169.254.0.0/16'] } };
+    // EKS Pod Identity agent (node-local link-local address).
+    const podIdentityEgress = { to: [{ ipBlock: { cidr: '169.254.170.23/32' } }], ports: [{ protocol: 'TCP', port: 80 }] };
     guardNamespace('HarnessDelegateGuardrails', delegateNs, delegateNamespace,
       { pods: '10', 'requests.cpu': '4', 'requests.memory': '8Gi' },
       {
         egress: [
           // Harness manager, AWS APIs, and the private EKS API endpoint.
           { to: [anyIp], ports: [{ protocol: 'TCP', port: 443 }] },
-          // Delegate -> build pod lite-engine.
-          { to: [nsName(buildNamespace)], ports: [{ protocol: 'TCP', port: 2001 }] },
-          // EKS Pod Identity agent (node-local link-local address).
-          { to: [{ ipBlock: { cidr: '169.254.170.23/32' } }], ports: [{ protocol: 'TCP', port: 80 }] },
+          // Delegate -> build pod lite-engine (20001).
+          { to: [nsName(buildNamespace)], ports: [{ protocol: 'TCP', port: 20001 }] },
+          podIdentityEgress,
         ],
       });
     guardNamespace('HarnessBuildGuardrails', buildNs, buildNamespace,
       { pods: '50', 'requests.cpu': '16', 'requests.memory': '48Gi' },
       {
-        ingress: [{ from: [nsName(delegateNamespace)], ports: [{ protocol: 'TCP', port: 2001 }] }],
+        ingress: [{ from: [nsName(delegateNamespace)], ports: [{ protocol: 'TCP', port: 20001 }] }],
         egress: [{ to: [anyIp], ports: [80, 443, 22].map((port) => ({ protocol: 'TCP', port })) }],
       });
+
+    // Delegate token: synced from Secrets Manager into the delegate namespace by
+    // External Secrets Operator (Pod Identity, read-only on this one secret). The
+    // admission webhook/cert-controller are off to keep the footprint small.
+    if (props.harnessDelegateTokenSecretName) {
+      const esoNamespace = 'external-secrets';
+      const tokenSecret = secretsmanager.Secret.fromSecretNameV2(this, 'DelegateTokenSecret', props.harnessDelegateTokenSecretName);
+      const esoRole = new iam.Role(this, 'ExternalSecretsRole', { assumedBy: new iam.ServicePrincipal('pods.eks.amazonaws.com') });
+      esoRole.assumeRolePolicy?.addStatements(new iam.PolicyStatement({
+        actions: ['sts:TagSession'],
+        principals: [new iam.ServicePrincipal('pods.eks.amazonaws.com')],
+      }));
+      tokenSecret.grantRead(esoRole);
+      const esoPodIdentity = new eks.CfnPodIdentityAssociation(this, 'ExternalSecretsPodIdentity', {
+        clusterName: cluster.clusterName,
+        namespace: esoNamespace,
+        serviceAccount: 'external-secrets',
+        roleArn: esoRole.roleArn,
+      });
+      esoPodIdentity.addResourceDependency(podIdentityAgent);
+
+      const esoNs = cluster.addManifest('ExternalSecretsNamespace', {
+        apiVersion: 'v1',
+        kind: 'Namespace',
+        metadata: { name: esoNamespace, labels: { ...tags, ...restrictedPssLabels } },
+      });
+      guardNamespace('ExternalSecretsGuardrails', esoNs, esoNamespace,
+        { pods: '5', 'requests.cpu': '2', 'requests.memory': '2Gi' },
+        { egress: [{ to: [anyIp], ports: [{ protocol: 'TCP', port: 443 }] }, podIdentityEgress] });
+
+      const esoChart = new eks.HelmChart(this, 'ExternalSecrets', {
+        cluster,
+        chart: 'external-secrets',
+        repository: 'https://charts.external-secrets.io',
+        version: '2.12.0',
+        namespace: esoNamespace,
+        createNamespace: false,
+        release: 'external-secrets',
+        wait: true,
+        values: {
+          serviceAccount: { name: 'external-secrets' },
+          webhook: { create: false },
+          certController: { create: false },
+        },
+      });
+      esoChart.node.addDependency(esoNs, esoPodIdentity);
+
+      const tokenSync = cluster.addManifest('DelegateTokenSync',
+        {
+          apiVersion: 'external-secrets.io/v1',
+          kind: 'SecretStore',
+          metadata: { name: 'aws-secrets-manager', namespace: delegateNamespace },
+          spec: { provider: { aws: { service: 'SecretsManager', region: this.region } } },
+        },
+        {
+          apiVersion: 'external-secrets.io/v1',
+          kind: 'ExternalSecret',
+          metadata: { name: delegateTokenK8sSecret, namespace: delegateNamespace },
+          spec: {
+            refreshInterval: '15m',
+            secretStoreRef: { name: 'aws-secrets-manager', kind: 'SecretStore' },
+            target: { name: delegateTokenK8sSecret, creationPolicy: 'Owner' },
+            data: [{ secretKey: 'DELEGATE_TOKEN', remoteRef: { key: props.harnessDelegateTokenSecretName } }],
+          },
+        },
+      );
+      tokenSync.node.addDependency(esoChart, delegateNs);
+      delegateChart.node.addDependency(tokenSync);
+    }
 
     // DP: images may only come from approved registries. Applies to every
     // namespace except system ones. Defaults to warn+audit so it can be rolled
@@ -699,10 +830,141 @@ export class CdkEksStack extends cdk.Stack {
       policyManifest.node.addDependency(cluster);
     }
 
+    // Node runtime/observability add-ons.
+    if (props.enableGuardDutyAgent) {
+      new eks.CfnAddon(this, 'GuardDutyAgentAddon', {
+        clusterName: cluster.clusterName,
+        addonName: 'aws-guardduty-agent',
+        resolveConflicts: 'OVERWRITE',
+      });
+    }
+
+    // CloudWatch agent + Fluent Bit (Container Insights) via Pod Identity.
+    const cloudWatchRole = new iam.Role(this, 'CloudWatchObservabilityRole', {
+      assumedBy: new iam.ServicePrincipal('pods.eks.amazonaws.com'),
+      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('CloudWatchAgentServerPolicy')],
+    });
+    cloudWatchRole.assumeRolePolicy?.addStatements(new iam.PolicyStatement({
+      actions: ['sts:TagSession'],
+      principals: [new iam.ServicePrincipal('pods.eks.amazonaws.com')],
+    }));
+    new eks.CfnAddon(this, 'CloudWatchObservabilityAddon', {
+      clusterName: cluster.clusterName,
+      addonName: 'amazon-cloudwatch-observability',
+      resolveConflicts: 'OVERWRITE',
+      podIdentityAssociations: [{ serviceAccount: 'cloudwatch-agent', roleArn: cloudWatchRole.roleArn }],
+    }).addResourceDependency(podIdentityAgent);
+
+    // ECR: KMS-encrypted, scan-on-push, immutable tags.
+    if (props.ecrRepositoryNames?.length) {
+      const ecrKey = new kms.Key(this, 'EcrKey', { enableKeyRotation: true, description: `KMS CMK for ECR repositories (${id})` });
+      for (const name of props.ecrRepositoryNames) {
+        new ecr.Repository(this, `Repo${name.replace(/[^A-Za-z0-9]/g, '')}`, {
+          repositoryName: name,
+          encryption: ecr.RepositoryEncryption.KMS,
+          encryptionKey: ecrKey,
+          imageScanOnPush: true,
+          imageTagMutability: ecr.TagMutability.IMMUTABLE,
+        });
+      }
+    }
+
+    // Backups: EBS CSI volumes via DLM. ponytail: targets every EBS CSI volume
+    // in the account/region (the driver's own tag); narrow with a per-cluster tag.
+    const dlmRole = new iam.Role(this, 'DlmRole', {
+      assumedBy: new iam.ServicePrincipal('dlm.amazonaws.com'),
+      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSDataLifecycleManagerServiceRole')],
+    });
+    new dlm.CfnLifecyclePolicy(this, 'EbsSnapshotPolicy', {
+      description: `Daily snapshots of EBS CSI volumes for ${id}`,
+      state: 'ENABLED',
+      executionRoleArn: dlmRole.roleArn,
+      policyDetails: {
+        resourceTypes: ['VOLUME'],
+        targetTags: [{ key: 'ebs.csi.aws.com/cluster', value: 'true' }],
+        schedules: [{
+          name: 'daily',
+          copyTags: true,
+          createRule: { interval: 24, intervalUnit: 'HOURS', times: ['05:00'] },
+          retainRule: { count: props.ebsSnapshotRetentionCount ?? 7 },
+        }],
+      },
+    });
+
+    // Backups: Velero saves cluster state to an encrypted, versioned bucket (EBS
+    // data is covered by DLM above, so Velero snapshots are off).
+    if (props.enableVelero) {
+      const veleroNamespace = 'velero';
+      const backupKey = new kms.Key(this, 'BackupKey', { enableKeyRotation: true, description: `KMS CMK for Velero backups (${id})` });
+      const backupBucket = new s3.Bucket(this, 'BackupBucket', {
+        encryption: s3.BucketEncryption.KMS,
+        encryptionKey: backupKey,
+        bucketKeyEnabled: true,
+        enforceSSL: true,
+        versioned: true,
+        blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      });
+      const veleroRole = new iam.Role(this, 'VeleroRole', { assumedBy: new iam.ServicePrincipal('pods.eks.amazonaws.com') });
+      veleroRole.assumeRolePolicy?.addStatements(new iam.PolicyStatement({
+        actions: ['sts:TagSession'],
+        principals: [new iam.ServicePrincipal('pods.eks.amazonaws.com')],
+      }));
+      backupBucket.grantReadWrite(veleroRole);
+      const veleroPodIdentity = new eks.CfnPodIdentityAssociation(this, 'VeleroPodIdentity', {
+        clusterName: cluster.clusterName,
+        namespace: veleroNamespace,
+        serviceAccount: 'velero-server',
+        roleArn: veleroRole.roleArn,
+      });
+      veleroPodIdentity.addResourceDependency(podIdentityAgent);
+
+      const veleroNs = cluster.addManifest('VeleroNamespace', {
+        apiVersion: 'v1',
+        kind: 'Namespace',
+        metadata: { name: veleroNamespace, labels: { ...tags, ...pssLabels('baseline') } },
+      });
+      guardNamespace('VeleroGuardrails', veleroNs, veleroNamespace,
+        { pods: '10', 'requests.cpu': '2', 'requests.memory': '4Gi' },
+        { egress: [{ to: [anyIp], ports: [{ protocol: 'TCP', port: 443 }] }, podIdentityEgress] });
+
+      const veleroChart = new eks.HelmChart(this, 'Velero', {
+        cluster,
+        chart: 'velero',
+        repository: 'https://vmware-tanzu.github.io/helm-charts',
+        version: '12.2.0',
+        namespace: veleroNamespace,
+        createNamespace: false,
+        release: 'velero',
+        values: {
+          serviceAccount: { server: { name: 'velero-server' } },
+          credentials: { useSecret: false },
+          snapshotsEnabled: false,
+          initContainers: [{
+            name: 'velero-plugin-for-aws',
+            image: props.veleroPluginImage ?? 'velero/velero-plugin-for-aws:v1.14.4',
+            volumeMounts: [{ mountPath: '/target', name: 'plugins' }],
+          }],
+          configuration: {
+            backupStorageLocation: [{
+              name: 'default',
+              provider: 'aws',
+              bucket: backupBucket.bucketName,
+              prefix: 'velero',
+              config: { region: this.region },
+            }],
+          },
+          schedules: {
+            daily: { schedule: '0 6 * * *', template: { ttl: '168h0m0s', includedNamespaces: ['*'] } },
+          },
+        },
+      });
+      veleroChart.node.addDependency(veleroNs, veleroPodIdentity);
+    }
+
     // IAM-3: least-privilege Role for running build pods, plus a RoleBinding for
     // the delegate SA (which lives in the delegate namespace). The delegate
     // discovers a build pod's IP via these pod reads and then connects to its
-    // lite-engine on TCP 2001 directly over the pod network — no extra rights.
+    // lite-engine on TCP 20001 directly over the pod network — no extra rights.
     const buildRole = cluster.addManifest('HarnessDelegateBuildRole', {
       apiVersion: 'rbac.authorization.k8s.io/v1',
       kind: 'Role',
@@ -770,6 +1032,39 @@ export class CdkEksStack extends cdk.Stack {
           accessScopeType: eks.AccessScopeType.CLUSTER,
         }),
       ]);
+    }
+
+    // IAM/ABAC: persona-based access entries scoped to the app namespaces (the
+    // ABAC aws:PrincipalTag conditions live on the federated roles themselves,
+    // outside this stack). Namespace-scoped policies cannot create namespaces.
+    const env = props.environment;
+    const appNamespaces = [delegateNamespace, buildNamespace];
+    const personaPolicy = {
+      engineer: env === 'prod' ? undefined : env === 'dev' ? 'AmazonEKSAdminPolicy' : 'AmazonEKSViewPolicy',
+      devops: 'AmazonEKSEditPolicy',
+      // View policy has no pods/exec, so support cannot exec in any environment.
+      support: 'AmazonEKSViewPolicy',
+      breakglass: 'AmazonEKSClusterAdminPolicy',
+    };
+    const breakGlassRoleNames: string[] = [];
+    for (const { persona, roleArn } of props.accessEntries ?? []) {
+      const policy = personaPolicy[persona];
+      const roleName = roleArn.split('/').pop() ?? roleArn;
+      if (!policy) {
+        cdk.Annotations.of(this).addWarning(`No ${persona} access in ${env}; skipping ${roleName}`);
+        continue;
+      }
+      const clusterWide = persona === 'breakglass';
+      new eks.CfnAccessEntry(this, `AccessEntry-${persona}-${roleName.replace(/[^A-Za-z0-9]/g, '')}`, {
+        clusterName: cluster.clusterName,
+        principalArn: roleArn,
+        accessPolicies: [{
+          policyArn: `arn:${this.partition}:eks::aws:cluster-access-policy/${policy}`,
+          accessScope: clusterWide ? { type: 'cluster' } : { type: 'namespace', namespaces: appNamespaces },
+        }],
+        tags: [{ key: 'persona', value: persona }, { key: 'environment', value: env }],
+      });
+      if (clusterWide) breakGlassRoleNames.push(roleName);
     }
 
     // LOG-8/9: turn the EKS control-plane audit log into actionable alarms.
@@ -848,6 +1143,14 @@ export class CdkEksStack extends cdk.Stack {
           '($.objectRef.namespace = "kube-system") }',
       },
     ];
+
+    // Alert whenever a break-glass principal touches the API.
+    breakGlassRoleNames.forEach((name, i) => auditAlarms.push({
+      id: `BreakGlassUse${i}`,
+      metricName: `BreakGlassUse${i}`,
+      description: `Break-glass role ${name} was used.`,
+      filterPattern: `{ $.user.username = "*assumed-role/${name}/*" }`,
+    }));
 
     for (const spec of auditAlarms) {
       const metricFilter = new logs.MetricFilter(this, `${spec.id}MetricFilter`, {

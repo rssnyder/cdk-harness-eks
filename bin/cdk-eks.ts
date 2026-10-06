@@ -27,15 +27,13 @@ function envList(name: string): string[] {
     .filter((v) => v.length > 0);
 }
 
-/** Parse EKS_TAGS="key=value,key2=value2" into a record. */
-function envTags(name: string): Record<string, string> {
-  return Object.fromEntries(
-    envList(name).map((kv) => {
-      const i = kv.indexOf('=');
-      if (i < 1) throw new Error(`${name}: expected key=value, got "${kv}"`);
-      return [kv.slice(0, i), kv.slice(i + 1)];
-    }),
-  );
+/** Parse "key=value,key2=value2" into ordered pairs (keys may repeat). */
+function envPairs(name: string): Array<[string, string]> {
+  return envList(name).map((kv) => {
+    const i = kv.indexOf('=');
+    if (i < 1) throw new Error(`${name}: expected key=value, got "${kv}"`);
+    return [kv.slice(0, i), kv.slice(i + 1)];
+  });
 }
 
 const app = new cdk.App();
@@ -48,7 +46,11 @@ new CdkEksStack(app, 'HarnessBuildFarm', {
    * never committed. The delegate token in particular must come from a secret
    * store (CI secret, AWS Secrets Manager, etc.). */
   harnessAccountId: requireEnv('HARNESS_ACCOUNT_ID'),
-  harnessDelegateToken: requireEnv('HARNESS_DELEGATE_TOKEN'),
+  // Preferred: name of a Secrets Manager secret synced in by External Secrets.
+  harnessDelegateTokenSecretName: process.env.HARNESS_DELEGATE_TOKEN_SECRET_NAME,
+  harnessDelegateToken: process.env.HARNESS_DELEGATE_TOKEN_SECRET_NAME
+    ? undefined
+    : requireEnv('HARNESS_DELEGATE_TOKEN'),
   harnessManagerEndpoint: process.env.HARNESS_MANAGER_ENDPOINT ?? 'https://app.harness.io/gratis',
   harnessDelegateImage:
     process.env.HARNESS_DELEGATE_IMAGE ??
@@ -72,7 +74,20 @@ new CdkEksStack(app, 'HarnessBuildFarm', {
   enforceAllowedImageRegistries: process.env.EKS_ENFORCE_IMAGE_REGISTRIES === 'true',
 
   /* Generic tags applied to all AWS resources and namespace labels. */
-  tags: envTags('EKS_TAGS'),
+  tags: Object.fromEntries(envPairs('EKS_TAGS')),
+
+  /* Environment and persona access (EKS_ACCESS_ENTRIES=engineer=<roleArn>,support=<roleArn>,...). */
+  environment: (process.env.EKS_ENVIRONMENT ?? 'dev') as 'dev' | 'test' | 'prod',
+  publicEndpointCidrs: envList('EKS_PUBLIC_ENDPOINT_CIDRS'),
+  clusterName: process.env.EKS_CLUSTER_NAME ?? 'buildfarm',
+  accessEntries: envPairs('EKS_ACCESS_ENTRIES').map(([persona, roleArn]) => ({
+    persona: persona as 'engineer' | 'devops' | 'support' | 'breakglass',
+    roleArn,
+  })),
+
+  enableGuardDutyAgent: process.env.EKS_ENABLE_GUARDDUTY_AGENT === 'true',
+  ecrRepositoryNames: envList('EKS_ECR_REPOSITORIES'),
+  enableVelero: process.env.EKS_ENABLE_VELERO === 'true',
 
   /* For more information, see https://docs.aws.amazon.com/cdk/latest/guide/environments.html */
 });

@@ -65,7 +65,7 @@ AWS Account 664418987337  ·  us-west-2
 └────────────────────────────────────────────────────────────────────────────────────┘
 
 ┌────────────────────────────────────────────────────────────────────────────────────┐
-│ Namespace: harness-delegate-ng                                                     │
+│ Namespace: harness-delegate                                                        │
 ├────────────────────────────────────────────────────────────────────────────────────┤
 │ Pod Security Standard enforce = restricted ............... [INFRA-6]               │
 │ Harness Delegate Deployment: restricted-compliant pod,                             │
