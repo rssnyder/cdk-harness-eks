@@ -484,7 +484,7 @@ export class CdkEksStack extends cdk.Stack {
         delegateToken: props.harnessDelegateToken,
         managerEndpoint: props.harnessManagerEndpoint,
         delegateDockerImage: props.harnessDelegateImage,
-        replicas: 1,
+        replicas: 3,
         // Upgrader disabled: the delegate image is managed declaratively via the
         // pinned delegateDockerImage above. Leaving the in-cluster upgrader on
         // makes it take server-side-apply ownership of the Deployment's image
